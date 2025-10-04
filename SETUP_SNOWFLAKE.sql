@@ -148,6 +148,31 @@ CREATE OR REPLACE TABLE GENERATION_PARAMETERS (
     UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
 );
 
+-- Customer lifecycle tracking table
+CREATE OR REPLACE TABLE CUSTOMER_LIFECYCLE (
+    CUSTOMER_TYPE STRING PRIMARY KEY, -- 'CORE_LOYAL', 'SLIDING_WINDOW'
+    MIN_CUSTOMER_ID_EPOCH INTEGER NOT NULL,
+    MAX_CUSTOMER_ID_EPOCH INTEGER NOT NULL,
+    CUSTOMER_COUNT INTEGER NOT NULL,
+    IS_ACTIVE BOOLEAN DEFAULT TRUE,
+    CHURN_PROBABILITY FLOAT DEFAULT 0.0,
+    DESCRIPTION STRING,
+    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Data generator sliding window status tracking
+-- This table tracks which customers are currently active in the generator's sliding window
+CREATE OR REPLACE TABLE GENERATOR_CUSTOMER_STATUS (
+    CUSTOMER_ID STRING PRIMARY KEY,
+    CUSTOMER_TYPE STRING NOT NULL, -- 'CORE_LOYAL', 'SLIDING_WINDOW'
+    IS_ACTIVE_IN_GENERATOR BOOLEAN NOT NULL DEFAULT TRUE,
+    LAST_ACTIVITY_DATE TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CHURN_DATE TIMESTAMP_NTZ,
+    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
 -- Insert default customer segments
 INSERT INTO CUSTOMER_SEGMENTS (SEGMENT_NAME, WEIGHT, AVG_ORDER_VALUE, PURCHASE_FREQUENCY, DESCRIPTION) VALUES
 ('premium', 0.15, 150.0, 0.3, 'High-value customers with frequent purchases'),
@@ -181,8 +206,12 @@ INSERT INTO WAREHOUSES (WAREHOUSE_ID, LOCATION_NAME, CAPACITY, DESCRIPTION) VALU
 
 -- Insert default generation parameters
 INSERT INTO GENERATION_PARAMETERS (PARAMETER_NAME, PARAMETER_VALUE, PARAMETER_TYPE, DESCRIPTION)
-SELECT 'customer_pool_size', TO_VARIANT('5000'), 'NUMBER', 'Number of consistent customers in the pool'
-UNION ALL SELECT 'repeat_customer_probability', TO_VARIANT('0.7'), 'NUMBER', 'Probability of selecting an existing customer for purchases'
+SELECT 'core_loyal_customers', TO_VARIANT('3500'), 'NUMBER', 'Number of core loyal customers who continue spending forever'
+UNION ALL SELECT 'sliding_window_customers', TO_VARIANT('1000'), 'NUMBER', 'Number of customers in the sliding window (join and churn)'
+UNION ALL SELECT 'sliding_window_days', TO_VARIANT('90'), 'NUMBER', 'Number of days for sliding window customer lifecycle'
+UNION ALL SELECT 'new_customer_join_rate', TO_VARIANT('0.08'), 'NUMBER', 'Probability of generating new customers in sliding window per run'
+UNION ALL SELECT 'sliding_customer_churn_rate', TO_VARIANT('0.03'), 'NUMBER', 'Probability of sliding window customers churning per run'
+UNION ALL SELECT 'repeat_customer_probability', TO_VARIANT('0.8'), 'NUMBER', 'Probability of selecting an existing customer for purchases'
 UNION ALL SELECT 'customer_preference_probability', TO_VARIANT('0.6'), 'NUMBER', 'Probability customer buys from preferred category'
 UNION ALL SELECT 'income_correlation_premium', TO_VARIANT('11.5'), 'NUMBER', 'Log-normal parameter for premium customer income'
 UNION ALL SELECT 'income_correlation_regular', TO_VARIANT('11.0'), 'NUMBER', 'Log-normal parameter for regular customer income'
@@ -198,6 +227,13 @@ UNION ALL SELECT 'payment_methods', PARSE_JSON('["credit_card", "debit_card", "p
 UNION ALL SELECT 'platforms', PARSE_JSON('["web", "mobile_app", "in_store", "phone"]'), 'ARRAY', 'Available sales platforms'
 UNION ALL SELECT 'device_types', PARSE_JSON('["desktop", "mobile", "tablet", "pos"]'), 'ARRAY', 'Available device types'
 UNION ALL SELECT 'shipping_methods', PARSE_JSON('["standard", "express", "overnight", "pickup"]'), 'ARRAY', 'Available shipping methods';
+
+-- Insert customer lifecycle configuration
+-- Core loyal customers: epoch range 1000000000 to 1100000000 (covers ~3 years, plenty of IDs)
+-- Sliding window customers: epoch range 1700000000 onwards (starts from 2023, uses current time)
+INSERT INTO CUSTOMER_LIFECYCLE (CUSTOMER_TYPE, MIN_CUSTOMER_ID_EPOCH, MAX_CUSTOMER_ID_EPOCH, CUSTOMER_COUNT, IS_ACTIVE, CHURN_PROBABILITY, DESCRIPTION) VALUES
+('CORE_LOYAL', 1000000000, 1100000000, 3500, TRUE, 0.001, 'Core loyal customers who continue spending forever with very low churn'),
+('SLIDING_WINDOW', 1700000000, EXTRACT(EPOCH FROM CURRENT_TIMESTAMP())::INTEGER, 1000, TRUE, 0.05, 'Sliding window customers who join and churn over time');
 
 -- Audit table for data generation runs
 CREATE OR REPLACE TABLE DATA_GENERATION_AUDIT (
@@ -217,12 +253,14 @@ CREATE OR REPLACE TABLE DATA_GENERATION_AUDIT (
     MARKETING_CHANNELS_SNAPSHOT VARIANT,
     WAREHOUSES_SNAPSHOT VARIANT,
     GENERATION_PARAMETERS_SNAPSHOT VARIANT,
+    CUSTOMER_LIFECYCLE_SNAPSHOT VARIANT,
     -- Reference data checksums for change tracking
     CUSTOMER_SEGMENTS_CHECKSUM STRING,
     PRODUCT_CATEGORIES_CHECKSUM STRING,
     MARKETING_CHANNELS_CHECKSUM STRING,
     WAREHOUSES_CHECKSUM STRING,
     GENERATION_PARAMETERS_CHECKSUM STRING,
+    CUSTOMER_LIFECYCLE_CHECKSUM STRING,
     CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
 );
 
@@ -442,6 +480,18 @@ class RetailDataGenerator:
                 "engagement_rate": row['ENGAGEMENT_RATE']
             }
         
+        # Load customer lifecycle configuration
+        lifecycle_df = self.session.table("RETAIL_STREAMING_DEMO.REFERENCE_DATA.CUSTOMER_LIFECYCLE").collect()
+        self.customer_lifecycle = {}
+        for row in lifecycle_df:
+            self.customer_lifecycle[row['CUSTOMER_TYPE']] = {
+                "min_epoch": row['MIN_CUSTOMER_ID_EPOCH'],
+                "max_epoch": row['MAX_CUSTOMER_ID_EPOCH'],
+                "customer_count": row['CUSTOMER_COUNT'],
+                "is_active": row['IS_ACTIVE'],
+                "churn_probability": row['CHURN_PROBABILITY']
+            }
+        
         # Load generation parameters
         params_df = self.session.table("RETAIL_STREAMING_DEMO.REFERENCE_DATA.GENERATION_PARAMETERS").collect()
         self.params = {}
@@ -484,12 +534,27 @@ class RetailDataGenerator:
                     self.params[param_name] = str(param_value)
     
     def _init_customer_pool(self):
-        """Initialize a consistent pool of customers with stable attributes."""
-        pool_size = int(self.params.get('customer_pool_size', 5000))
-        self.customer_pool = {}
+        """Initialize customer pools using epoch-based IDs and sliding window logic."""
+        import time
         
-        for i in range(pool_size):
-            customer_id = f"CUST_{i+100000:06d}"
+        self.customer_pool = {}
+        self.active_sliding_customers = set()
+        current_epoch = int(time.time())
+        
+        # Initialize core loyal customers (fixed epoch range)
+        core_config = self.customer_lifecycle.get('CORE_LOYAL', {})
+        core_count = core_config.get('customer_count', 3500)
+        core_min_epoch = core_config.get('min_epoch', 1000000000)
+        core_max_epoch = core_config.get('max_epoch', 1100000000)
+        
+        # Generate core loyal customers with deterministic epoch-based IDs
+        epoch_step = (core_max_epoch - core_min_epoch) // core_count
+        for i in range(core_count):
+            customer_epoch = core_min_epoch + (i * epoch_step)
+            customer_id = f"CUST_{customer_epoch}"
+            
+            # Use epoch as seed for consistent customer attributes
+            np.random.seed(customer_epoch % 2147483647)  # Ensure seed is within int32 range
             
             # Assign segment based on weights
             segment_weights = [seg["weight"] for seg in self.customer_segments.values()]
@@ -501,7 +566,7 @@ class RetailDataGenerator:
             age = int(np.random.normal(age_mean, age_std))
             age = max(18, min(80, age))
             
-            # Income correlates with segment (using reference data parameters)
+            # Income correlates with segment
             if segment == "premium":
                 income_param = self.params.get('income_correlation_premium', 11.5)
                 income = int(np.random.lognormal(income_param, 0.5))
@@ -522,6 +587,7 @@ class RetailDataGenerator:
             
             self.customer_pool[customer_id] = {
                 "customer_id": customer_id,
+                "customer_type": "CORE_LOYAL",
                 "segment": segment,
                 "age": age,
                 "income": income,
@@ -533,26 +599,403 @@ class RetailDataGenerator:
                 "price_sensitivity": price_sensitivity,
                 "total_orders": 0,
                 "total_spent": 0.0,
-                "last_purchase_date": None
+                "last_purchase_date": None,
+                "join_date": datetime.fromtimestamp(customer_epoch),
+                "is_active": True
             }
+        
+        # Initialize sliding window customers (recent epoch range)
+        sliding_config = self.customer_lifecycle.get('SLIDING_WINDOW', {})
+        sliding_count = sliding_config.get('customer_count', 1000)
+        sliding_window_days = int(self.params.get('sliding_window_days', 90))
+        
+        # Calculate sliding window epoch range (last N days)
+        window_start_epoch = current_epoch - (sliding_window_days * 24 * 60 * 60)
+        # Update max epoch to current time
+        sliding_config['max_epoch'] = current_epoch
+        
+        # Generate sliding window customers distributed across the time window
+        for i in range(sliding_count):
+            # Distribute customers across the sliding window timeframe
+            customer_epoch = window_start_epoch + int((current_epoch - window_start_epoch) * (i / sliding_count))
+            customer_id = f"CUST_{customer_epoch}"
+            
+            # Use epoch as seed for consistent customer attributes
+            np.random.seed(customer_epoch % 2147483647)
+            
+            # Sliding window customers tend to be newer, so different segment distribution
+            segment_weights = [0.2, 0.5, 0.3]  # More occasional customers in sliding window
+            segment = np.random.choice(list(self.customer_segments.keys()), p=segment_weights)
+            
+            # Generate customer attributes (similar to core customers)
+            age_mean = self.params.get('age_mean', 42)
+            age_std = self.params.get('age_std', 15)
+            age = int(np.random.normal(age_mean, age_std))
+            age = max(18, min(80, age))
+            
+            if segment == "premium":
+                income_param = self.params.get('income_correlation_premium', 11.5)
+                income = int(np.random.lognormal(income_param, 0.5))
+            elif segment == "regular":
+                income_param = self.params.get('income_correlation_regular', 11.0)
+                income = int(np.random.lognormal(income_param, 0.4))
+            else:
+                income_param = self.params.get('income_correlation_occasional', 10.5)
+                income = int(np.random.lognormal(income_param, 0.3))
+            
+            state = self.fake.state()
+            city = self.fake.city()
+            zip_code = self.fake.zipcode()
+            primary_category = random.choice(list(self.product_categories.keys()))
+            communication_channel = random.choice(self.params.get('communication_channels', ["email", "sms", "push", "mail"]))
+            price_sensitivity = round(random.uniform(0.1, 1.0), 2)
+            
+            # Determine if this sliding customer is still active based on churn probability
+            days_since_join = (current_epoch - customer_epoch) / (24 * 60 * 60)
+            churn_prob = sliding_config.get('churn_probability', 0.05)
+            # Higher churn probability for older sliding window customers
+            adjusted_churn_prob = churn_prob * (days_since_join / sliding_window_days)
+            is_active = random.random() > adjusted_churn_prob
+            
+            if is_active:
+                self.active_sliding_customers.add(customer_id)
+            
+            self.customer_pool[customer_id] = {
+                "customer_id": customer_id,
+                "customer_type": "SLIDING_WINDOW",
+                "segment": segment,
+                "age": age,
+                "income": income,
+                "state": state,
+                "city": city,
+                "zip_code": zip_code,
+                "primary_category": primary_category,
+                "communication_channel": communication_channel,
+                "price_sensitivity": price_sensitivity,
+                "total_orders": 0,
+                "total_spent": 0.0,
+                "last_purchase_date": None,
+                "join_date": datetime.fromtimestamp(customer_epoch),
+                "is_active": is_active
+            }
+        
+        # Reset random seed to current time for subsequent random operations
+        np.random.seed(None)
     
     def _get_customer_profile(self, customer_id: str = None, segment_preference: str = None) -> dict:
-        """Get a customer profile, either specific ID or random from pool."""
-        if customer_id and customer_id in self.customer_pool:
-            return self.customer_pool[customer_id].copy()
+        """Get a customer profile, checking database for current active status."""
         
-        available_customers = list(self.customer_pool.keys())
-        if segment_preference:
-            available_customers = [
-                cid for cid in available_customers 
-                if self.customer_pool[cid]["segment"] == segment_preference
-            ]
+        # If specific customer requested, check if they exist and are active
+        if customer_id:
+            if customer_id in self.customer_pool:
+                customer = self.customer_pool[customer_id]
+                # Core loyal customers are always active
+                if customer["customer_type"] == "CORE_LOYAL":
+                    return customer.copy()
+                # For sliding window customers, check database for latest status
+                else:
+                    return self._get_customer_from_database(customer_id)
+            else:
+                # Customer not in current pool, check database
+                return self._get_customer_from_database(customer_id)
+        
+        # Get random active customer from database
+        return self._get_random_active_customer_from_database(segment_preference)
+    
+    def _get_customer_from_database(self, customer_id: str) -> dict:
+        """Get specific customer profile from database with actual generator status."""
+        try:
+            # Query customer profile with generator status
+            query = f"""
+            SELECT 
+                c.customer_id,
+                c.customer_segment,
+                c.age,
+                c.annual_income,
+                c.state,
+                c.city,
+                c.zip_code,
+                c.primary_category,
+                c.communication_channel,
+                c.price_sensitivity,
+                c.total_orders,
+                c.avg_order_value,
+                c.lifetime_value,
+                c.last_profile_update,
+                -- Get actual generator status from database
+                COALESCE(g.is_active_in_generator, 
+                    CASE WHEN c.customer_id LIKE 'CUST_10%' THEN TRUE ELSE FALSE END
+                ) as is_active
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY last_profile_update DESC) as rn
+                FROM RETAIL_STREAMING_DEMO.S2_BRONZE.STG_CUSTOMERS
+                WHERE customer_id = '{customer_id}'
+            ) c
+            LEFT JOIN RETAIL_STREAMING_DEMO.REFERENCE_DATA.GENERATOR_CUSTOMER_STATUS g
+                ON c.customer_id = g.customer_id
+            WHERE c.rn = 1
+            """
+            
+            result = self.session.sql(query).collect()
+            
+            if result and len(result) > 0:
+                row = result[0]
+                # Only return if customer is active in generator
+                if row['IS_ACTIVE']:
+                    return {
+                        "customer_id": row['CUSTOMER_ID'],
+                        "segment": row['CUSTOMER_SEGMENT'],
+                        "age": row['AGE'],
+                        "income": row['ANNUAL_INCOME'],
+                        "state": row['STATE'],
+                        "city": row['CITY'],
+                        "zip_code": row['ZIP_CODE'],
+                        "primary_category": row['PRIMARY_CATEGORY'],
+                        "communication_channel": row['COMMUNICATION_CHANNEL'],
+                        "price_sensitivity": row['PRICE_SENSITIVITY'],
+                        "total_orders": row['TOTAL_ORDERS'] or 0,
+                        "total_spent": (row['TOTAL_ORDERS'] or 0) * (row['AVG_ORDER_VALUE'] or 0),
+                        "avg_order_value": row['AVG_ORDER_VALUE'] or 0,
+                        "lifetime_value": row['LIFETIME_VALUE'] or 0,
+                        "last_purchase_date": row['LAST_PROFILE_UPDATE'],
+                        "is_active": row['IS_ACTIVE'],
+                        "customer_type": self._determine_customer_type(row['CUSTOMER_ID'])
+                    }
+            
+            return None  # Customer not found or inactive
+            
+        except Exception as e:
+            # If database query fails, fall back to in-memory pool
+            if customer_id in self.customer_pool:
+                return self.customer_pool[customer_id].copy()
+            return None
+    
+    def _get_random_active_customer_from_database(self, segment_preference: str = None) -> dict:
+        """Get random active customer from database based on generator status."""
+        try:
+            # Build query to get customers active in the generator
+            segment_filter = f"AND c.customer_segment = '{segment_preference}'" if segment_preference else ""
+            
+            query = f"""
+            SELECT 
+                c.customer_id,
+                c.customer_segment,
+                c.age,
+                c.annual_income,
+                c.state,
+                c.city,
+                c.zip_code,
+                c.primary_category,
+                c.communication_channel,
+                c.price_sensitivity,
+                c.total_orders,
+                c.avg_order_value,
+                c.lifetime_value,
+                c.last_profile_update
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY last_profile_update DESC) as rn
+                FROM RETAIL_STREAMING_DEMO.S2_BRONZE.STG_CUSTOMERS
+                WHERE 1=1
+                {segment_filter}
+            ) c
+            LEFT JOIN RETAIL_STREAMING_DEMO.REFERENCE_DATA.GENERATOR_CUSTOMER_STATUS g
+                ON c.customer_id = g.customer_id
+            WHERE c.rn = 1
+                AND (
+                    -- Core loyal customers are always active
+                    c.customer_id LIKE 'CUST_10%' 
+                    OR 
+                    -- Sliding window customers must be active in generator
+                    (g.is_active_in_generator = TRUE OR g.customer_id IS NULL)
+                )
+            ORDER BY RANDOM()
+            LIMIT 1
+            """
+            
+            result = self.session.sql(query).collect()
+            
+            if result and len(result) > 0:
+                row = result[0]
+                return {
+                    "customer_id": row['CUSTOMER_ID'],
+                    "segment": row['CUSTOMER_SEGMENT'],
+                    "age": row['AGE'],
+                    "income": row['ANNUAL_INCOME'],
+                    "state": row['STATE'],
+                    "city": row['CITY'],
+                    "zip_code": row['ZIP_CODE'],
+                    "primary_category": row['PRIMARY_CATEGORY'],
+                    "communication_channel": row['COMMUNICATION_CHANNEL'],
+                    "price_sensitivity": row['PRICE_SENSITIVITY'],
+                    "total_orders": row['TOTAL_ORDERS'] or 0,
+                    "total_spent": (row['TOTAL_ORDERS'] or 0) * (row['AVG_ORDER_VALUE'] or 0),
+                    "avg_order_value": row['AVG_ORDER_VALUE'] or 0,
+                    "lifetime_value": row['LIFETIME_VALUE'] or 0,
+                    "last_purchase_date": row['LAST_PROFILE_UPDATE'],
+                    "is_active": True,
+                    "customer_type": self._determine_customer_type(row['CUSTOMER_ID'])
+                }
+            
+            # Fallback to in-memory pool if no database customers found
+            return self._get_random_customer_from_pool(segment_preference)
+            
+        except Exception as e:
+            # If database query fails, fall back to in-memory pool
+            return self._get_random_customer_from_pool(segment_preference)
+    
+    def _determine_customer_type(self, customer_id: str) -> str:
+        """Determine customer type based on customer ID epoch."""
+        try:
+            epoch_str = customer_id.replace("CUST_", "")
+            epoch = int(epoch_str)
+            
+            # Core loyal customers: 1000000000 to 1100000000
+            if 1000000000 <= epoch <= 1100000000:
+                return "CORE_LOYAL"
+            else:
+                return "SLIDING_WINDOW"
+        except:
+            return "SLIDING_WINDOW"  # Default fallback
+    
+    def _get_random_customer_from_pool(self, segment_preference: str = None) -> dict:
+        """Fallback method to get customer from in-memory pool."""
+        available_customers = []
+        for cid, customer in self.customer_pool.items():
+            # Only include active customers
+            is_available = (
+                customer["customer_type"] == "CORE_LOYAL" or 
+                (customer["customer_type"] == "SLIDING_WINDOW" and customer.get("is_active", True))
+            )
+            
+            if is_available:
+                if not segment_preference or customer["segment"] == segment_preference:
+                    available_customers.append(cid)
         
         if not available_customers:
-            available_customers = list(self.customer_pool.keys())
+            # Fallback to all core loyal customers (they're always active)
+            available_customers = [
+                cid for cid, customer in self.customer_pool.items() 
+                if customer["customer_type"] == "CORE_LOYAL"
+            ]
         
-        selected_customer_id = random.choice(available_customers)
-        return self.customer_pool[selected_customer_id].copy()
+        if available_customers:
+            selected_customer_id = random.choice(available_customers)
+            return self.customer_pool[selected_customer_id].copy()
+        else:
+            return None  # No active customers available
+    
+    def _manage_sliding_window_customers(self):
+        """Manage sliding window customers: add new ones and churn existing ones."""
+        import time
+        
+        current_epoch = int(time.time())
+        sliding_config = self.customer_lifecycle.get('SLIDING_WINDOW', {})
+        target_sliding_customers = sliding_config.get('customer_count', 1000)
+        
+        # Count current active sliding window customers
+        current_sliding_customers = [
+            cid for cid, customer in self.customer_pool.items()
+            if customer["customer_type"] == "SLIDING_WINDOW" and customer["is_active"]
+        ]
+        current_count = len(current_sliding_customers)
+        
+        # Calculate how many customers we need to add/remove to maintain target
+        new_customer_rate = self.params.get('new_customer_join_rate', 0.08)  # 8% chance
+        churn_rate = self.params.get('sliding_customer_churn_rate', 0.03)    # 3% chance
+        
+        # Add new customers (higher probability if below target)
+        add_probability = new_customer_rate
+        if current_count < target_sliding_customers * 0.8:  # If below 80% of target
+            add_probability = new_customer_rate * 2  # Double the add rate
+        elif current_count > target_sliding_customers * 1.2:  # If above 120% of target
+            add_probability = new_customer_rate * 0.5  # Reduce the add rate
+        
+        if random.random() < add_probability:
+            self._add_new_sliding_customer(current_epoch)
+        
+        # Churn existing customers (lower probability if below target)
+        churn_probability = churn_rate
+        if current_count < target_sliding_customers * 0.9:  # If below 90% of target
+            churn_probability = churn_rate * 0.5  # Reduce churn rate
+        elif current_count > target_sliding_customers * 1.1:  # If above 110% of target
+            churn_probability = churn_rate * 1.5  # Increase churn rate
+        
+        for customer_id in current_sliding_customers:
+            if random.random() < churn_probability:
+                self.customer_pool[customer_id]["is_active"] = False
+                self.active_sliding_customers.discard(customer_id)
+                # Update database status
+                self._update_generator_customer_status(customer_id, False, "SLIDING_WINDOW")
+    
+    def _add_new_sliding_customer(self, current_epoch: int):
+        """Add a new customer to the sliding window."""
+        # Find next available epoch-based ID to avoid collisions
+        base_epoch = current_epoch
+        customer_id = f"CUST_{base_epoch}"
+        
+        # If ID already exists, increment epoch until we find an unused one
+        while customer_id in self.customer_pool:
+            base_epoch += 1
+            customer_id = f"CUST_{base_epoch}"
+        
+        # Use current epoch as seed for consistent attributes
+        np.random.seed(current_epoch % 2147483647)
+        
+        # New customers tend to be occasional segment initially
+        segment_weights = [0.1, 0.4, 0.5]  # Favor occasional for new customers
+        segment = np.random.choice(list(self.customer_segments.keys()), p=segment_weights)
+        
+        # Generate customer attributes
+        age_mean = self.params.get('age_mean', 42)
+        age_std = self.params.get('age_std', 15)
+        age = int(np.random.normal(age_mean, age_std))
+        age = max(18, min(80, age))
+        
+        if segment == "premium":
+            income_param = self.params.get('income_correlation_premium', 11.5)
+            income = int(np.random.lognormal(income_param, 0.5))
+        elif segment == "regular":
+            income_param = self.params.get('income_correlation_regular', 11.0)
+            income = int(np.random.lognormal(income_param, 0.4))
+        else:
+            income_param = self.params.get('income_correlation_occasional', 10.5)
+            income = int(np.random.lognormal(income_param, 0.3))
+        
+        state = self.fake.state()
+        city = self.fake.city()
+        zip_code = self.fake.zipcode()
+        primary_category = random.choice(list(self.product_categories.keys()))
+        communication_channel = random.choice(self.params.get('communication_channels', ["email", "sms", "push", "mail"]))
+        price_sensitivity = round(random.uniform(0.1, 1.0), 2)
+        
+        self.customer_pool[customer_id] = {
+            "customer_id": customer_id,
+            "customer_type": "SLIDING_WINDOW",
+            "segment": segment,
+            "age": age,
+            "income": income,
+            "state": state,
+            "city": city,
+            "zip_code": zip_code,
+            "primary_category": primary_category,
+            "communication_channel": communication_channel,
+            "price_sensitivity": price_sensitivity,
+            "total_orders": 0,
+            "total_spent": 0.0,
+            "last_purchase_date": None,
+            "join_date": datetime.fromtimestamp(current_epoch),
+            "is_active": True
+        }
+        
+        self.active_sliding_customers.add(customer_id)
+        
+        # Update database status for new customer
+        self._update_generator_customer_status(customer_id, True, "SLIDING_WINDOW")
+        
+        # Reset random seed
+        np.random.seed(None)
     
     def _update_customer_stats(self, customer_id: str, purchase_amount: float, purchase_date: datetime):
         """Update customer statistics based on new purchase."""
@@ -562,23 +1005,130 @@ class RetailDataGenerator:
             customer["total_spent"] += purchase_amount
             if customer["last_purchase_date"] is None or purchase_date > customer["last_purchase_date"]:
                 customer["last_purchase_date"] = purchase_date
+            
+            # Reactivate customer if they make a purchase (in case they were marked inactive)
+            if customer["customer_type"] == "SLIDING_WINDOW":
+                customer["is_active"] = True
+                # Update database status
+                self._update_generator_customer_status(customer_id, True, "SLIDING_WINDOW")
+    
+    def _get_active_customer_count(self) -> dict:
+        """Get count of active customers by type."""
+        counts = {"CORE_LOYAL": 0, "SLIDING_WINDOW_ACTIVE": 0, "SLIDING_WINDOW_INACTIVE": 0}
+        
+        for customer in self.customer_pool.values():
+            if customer["customer_type"] == "CORE_LOYAL":
+                counts["CORE_LOYAL"] += 1
+            elif customer["customer_type"] == "SLIDING_WINDOW":
+                if customer["is_active"]:
+                    counts["SLIDING_WINDOW_ACTIVE"] += 1
+                else:
+                    counts["SLIDING_WINDOW_INACTIVE"] += 1
+        
+        return counts
+    
+    def _scale_events_by_customer_count(self, base_events: int) -> int:
+        """Scale the number of events based on current active customer count."""
+        # Get target customer counts
+        core_config = self.customer_lifecycle.get('CORE_LOYAL', {})
+        sliding_config = self.customer_lifecycle.get('SLIDING_WINDOW', {})
+        
+        target_core_customers = core_config.get('customer_count', 3500)
+        target_sliding_customers = sliding_config.get('customer_count', 1000)
+        target_total_customers = target_core_customers + target_sliding_customers  # 4500
+        
+        # Count current active customers
+        current_active_customers = 0
+        for customer in self.customer_pool.values():
+            if customer["customer_type"] == "CORE_LOYAL" or customer.get("is_active", True):
+                current_active_customers += 1
+        
+        # Calculate scaling factor
+        if target_total_customers > 0:
+            scaling_factor = current_active_customers / target_total_customers
+        else:
+            scaling_factor = 1.0
+        
+        # Apply scaling with some bounds to prevent extreme values
+        scaling_factor = max(0.5, min(2.0, scaling_factor))  # Between 50% and 200%
+        
+        scaled_events = int(base_events * scaling_factor)
+        
+        # Ensure we always generate at least some events
+        return max(1, scaled_events)
+    
+    def _update_generator_customer_status(self, customer_id: str, is_active: bool, customer_type: str = None):
+        """Update the generator customer status in the database."""
+        try:
+            if customer_type is None:
+                customer_type = self._determine_customer_type(customer_id)
+            
+            if is_active:
+                # Mark customer as active
+                query = f"""
+                MERGE INTO RETAIL_STREAMING_DEMO.REFERENCE_DATA.GENERATOR_CUSTOMER_STATUS AS target
+                USING (SELECT '{customer_id}' as customer_id, '{customer_type}' as customer_type) AS source
+                ON target.customer_id = source.customer_id
+                WHEN MATCHED THEN
+                    UPDATE SET 
+                        is_active_in_generator = TRUE,
+                        last_activity_date = CURRENT_TIMESTAMP(),
+                        churn_date = NULL,
+                        updated_at = CURRENT_TIMESTAMP()
+                WHEN NOT MATCHED THEN
+                    INSERT (customer_id, customer_type, is_active_in_generator, last_activity_date, created_at, updated_at)
+                    VALUES ('{customer_id}', '{customer_type}', TRUE, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+                """
+            else:
+                # Mark customer as churned
+                query = f"""
+                MERGE INTO RETAIL_STREAMING_DEMO.REFERENCE_DATA.GENERATOR_CUSTOMER_STATUS AS target
+                USING (SELECT '{customer_id}' as customer_id, '{customer_type}' as customer_type) AS source
+                ON target.customer_id = source.customer_id
+                WHEN MATCHED THEN
+                    UPDATE SET 
+                        is_active_in_generator = FALSE,
+                        churn_date = CURRENT_TIMESTAMP(),
+                        updated_at = CURRENT_TIMESTAMP()
+                WHEN NOT MATCHED THEN
+                    INSERT (customer_id, customer_type, is_active_in_generator, churn_date, created_at, updated_at)
+                    VALUES ('{customer_id}', '{customer_type}', FALSE, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+                """
+            
+            self.session.sql(query).collect()
+            
+        except Exception as e:
+            # Don't fail generation if status update fails
+            print(f"Warning: Failed to update generator customer status for {customer_id}: {str(e)}")
 
     def generate_customer_events(self, num_events: int) -> List[Dict[str, Any]]:
         """Generate customer interaction and transaction events."""
         events = []
         current_time = datetime.utcnow()
         
-        for _ in range(num_events):
+        # Manage sliding window customers before generating events
+        self._manage_sliding_window_customers()
+        
+        # Scale customer events based on active customer count
+        scaled_events = self._scale_events_by_customer_count(num_events)
+        
+        for _ in range(scaled_events):
             customer_profile = self._get_customer_profile()
+            if customer_profile is None:
+                continue  # Skip if no active customers available
+            
             customer_id = customer_profile["customer_id"]
             segment = customer_profile["segment"]
             segment_data = self.customer_segments[segment]
             
-            days_since_last_purchase = (
-                (current_time.date() - customer_profile["last_purchase_date"]).days 
-                if customer_profile["last_purchase_date"] 
-                else int(np.random.exponential(30))
-            )
+            # Calculate days since last purchase, handling both date and datetime types
+            days_since_last_purchase = int(np.random.exponential(30))  # Default
+            if customer_profile["last_purchase_date"]:
+                last_purchase = customer_profile["last_purchase_date"]
+                # Convert to date if it's a datetime object
+                if hasattr(last_purchase, 'date'):
+                    last_purchase = last_purchase.date()
+                days_since_last_purchase = (current_time.date() - last_purchase).days
             
             total_orders = customer_profile["total_orders"]
             if total_orders == 0:
@@ -597,7 +1147,7 @@ class RetailDataGenerator:
             event = {
                 "event_id": f"CUST_EVT_{random.randint(1000000, 9999999)}",
                 "customer_id": customer_id,
-                "event_type": "customer_profile_update",
+                "event_type": "customer_profile",
                 "timestamp": event_time.isoformat(),
                 "data": {
                     "customer_segment": segment,
@@ -634,7 +1184,13 @@ class RetailDataGenerator:
         events = []
         current_time = datetime.utcnow()
         
-        for _ in range(num_events):
+        # Manage sliding window customers before generating events
+        self._manage_sliding_window_customers()
+        
+        # Scale purchase events based on active customer count
+        scaled_events = self._scale_events_by_customer_count(num_events)
+        
+        for _ in range(scaled_events):
             hour = int(np.random.choice(24, p=self._get_hourly_purchase_distribution()))
             event_time = current_time.replace(
                 hour=hour,
@@ -653,6 +1209,9 @@ class RetailDataGenerator:
                     customer_profile = self._get_customer_profile()
             else:
                 customer_profile = self._get_customer_profile()
+            
+            if customer_profile is None:
+                continue  # Skip if no active customers available
             
             customer_id = customer_profile["customer_id"]
             segment = customer_profile["segment"]
@@ -816,6 +1375,12 @@ def _capture_reference_audit_data(session: Session) -> dict:
     audit_data['generation_parameters_snapshot'] = params_data
     audit_data['generation_parameters_checksum'] = hashlib.md5(json.dumps(params_data, sort_keys=True, default=str).encode()).hexdigest()
     
+    # Capture customer lifecycle configuration
+    lifecycle_df = session.table("RETAIL_STREAMING_DEMO.REFERENCE_DATA.CUSTOMER_LIFECYCLE").collect()
+    lifecycle_data = [dict(row.as_dict()) for row in lifecycle_df]
+    audit_data['customer_lifecycle_snapshot'] = lifecycle_data
+    audit_data['customer_lifecycle_checksum'] = hashlib.md5(json.dumps(lifecycle_data, sort_keys=True, default=str).encode()).hexdigest()
+    
     return audit_data
 
 
@@ -842,11 +1407,13 @@ def _log_generation_run(session: Session, run_id: str, customer_events: int, pur
             'MARKETING_CHANNELS_SNAPSHOT': json.dumps(audit_data['marketing_channels_snapshot']),
             'WAREHOUSES_SNAPSHOT': json.dumps(audit_data['warehouses_snapshot']),
             'GENERATION_PARAMETERS_SNAPSHOT': json.dumps(audit_data['generation_parameters_snapshot']),
+            'CUSTOMER_LIFECYCLE_SNAPSHOT': json.dumps(audit_data['customer_lifecycle_snapshot']),
             'CUSTOMER_SEGMENTS_CHECKSUM': audit_data['customer_segments_checksum'],
             'PRODUCT_CATEGORIES_CHECKSUM': audit_data['product_categories_checksum'],
             'MARKETING_CHANNELS_CHECKSUM': audit_data['marketing_channels_checksum'],
             'WAREHOUSES_CHECKSUM': audit_data['warehouses_checksum'],
-            'GENERATION_PARAMETERS_CHECKSUM': audit_data['generation_parameters_checksum']
+            'GENERATION_PARAMETERS_CHECKSUM': audit_data['generation_parameters_checksum'],
+            'CUSTOMER_LIFECYCLE_CHECKSUM': audit_data['customer_lifecycle_checksum']
         }]
         
         audit_schema = StructType([
@@ -865,11 +1432,13 @@ def _log_generation_run(session: Session, run_id: str, customer_events: int, pur
             StructField("MARKETING_CHANNELS_SNAPSHOT", VariantType()),
             StructField("WAREHOUSES_SNAPSHOT", VariantType()),
             StructField("GENERATION_PARAMETERS_SNAPSHOT", VariantType()),
+            StructField("CUSTOMER_LIFECYCLE_SNAPSHOT", VariantType()),
             StructField("CUSTOMER_SEGMENTS_CHECKSUM", StringType()),
             StructField("PRODUCT_CATEGORIES_CHECKSUM", StringType()),
             StructField("MARKETING_CHANNELS_CHECKSUM", StringType()),
             StructField("WAREHOUSES_CHECKSUM", StringType()),
-            StructField("GENERATION_PARAMETERS_CHECKSUM", StringType())
+            StructField("GENERATION_PARAMETERS_CHECKSUM", StringType()),
+            StructField("CUSTOMER_LIFECYCLE_CHECKSUM", StringType())
         ])
         
         audit_df_data = []
@@ -890,11 +1459,13 @@ def _log_generation_run(session: Session, run_id: str, customer_events: int, pur
                 record['MARKETING_CHANNELS_SNAPSHOT'],
                 record['WAREHOUSES_SNAPSHOT'],
                 record['GENERATION_PARAMETERS_SNAPSHOT'],
+                record['CUSTOMER_LIFECYCLE_SNAPSHOT'],
                 record['CUSTOMER_SEGMENTS_CHECKSUM'],
                 record['PRODUCT_CATEGORIES_CHECKSUM'],
                 record['MARKETING_CHANNELS_CHECKSUM'],
                 record['WAREHOUSES_CHECKSUM'],
-                record['GENERATION_PARAMETERS_CHECKSUM']
+                record['GENERATION_PARAMETERS_CHECKSUM'],
+                record['CUSTOMER_LIFECYCLE_CHECKSUM']
             ])
         
         audit_df = session.create_dataframe(audit_df_data, audit_schema)
@@ -944,7 +1515,7 @@ def main(session: Session, customer_events: int = 10, purchase_events: int = 25,
                 event["event_id"],
                 event["event_type"],
                 event["timestamp"],
-                json.dumps(event, default=str),
+                json.dumps(event),
                 datetime.utcnow().isoformat()
             ])
         
@@ -987,99 +1558,90 @@ RETURNS STRING
 LANGUAGE SQL
 AS
 $$
+DECLARE
+    customer_count INTEGER;
+    purchase_count INTEGER;
 BEGIN
-    -- Transform customers
-    MERGE INTO S2_BRONZE.STG_CUSTOMERS AS target
-    USING (
-        SELECT 
-            RAW_DATA:customer_id::STRING as customer_id,
-            RAW_DATA:data.age::INTEGER as age,
-            RAW_DATA:data.income::INTEGER as annual_income,
-            RAW_DATA:data.customer_segment::STRING as customer_segment,
-            RAW_DATA:data.location.state::STRING as state,
-            RAW_DATA:data.location.city::STRING as city,
-            RAW_DATA:data.location.zip_code::STRING as zip_code,
-            RAW_DATA:data.behavioral_metrics.days_since_last_purchase::INTEGER as days_since_last_purchase,
-            RAW_DATA:data.behavioral_metrics.total_orders::INTEGER as total_orders,
-            RAW_DATA:data.behavioral_metrics.avg_order_value::FLOAT as avg_order_value,
-            RAW_DATA:data.behavioral_metrics.churn_probability::FLOAT as churn_probability,
-            RAW_DATA:data.behavioral_metrics.lifetime_value::FLOAT as lifetime_value,
-            RAW_DATA:data.preferences.primary_category::STRING as primary_category,
-            RAW_DATA:data.preferences.communication_channel::STRING as communication_channel,
-            RAW_DATA:data.preferences.price_sensitivity::FLOAT as price_sensitivity,
-            TIMESTAMP as last_profile_update,
-            CURRENT_TIMESTAMP() as updated_at
-        FROM PUBLIC.RAW_RETAIL_EVENTS_STREAM
-        WHERE EVENT_TYPE = 'customer_profile_update'
-            AND METADATA$ACTION = 'INSERT'
-    ) AS source
-    ON target.customer_id = source.customer_id
-    WHEN MATCHED THEN
-        UPDATE SET
-            age = source.age,
-            annual_income = source.annual_income,
-            customer_segment = source.customer_segment,
-            state = source.state,
-            city = source.city,
-            zip_code = source.zip_code,
-            days_since_last_purchase = source.days_since_last_purchase,
-            total_orders = source.total_orders,
-            avg_order_value = source.avg_order_value,
-            churn_probability = source.churn_probability,
-            lifetime_value = source.lifetime_value,
-            primary_category = source.primary_category,
-            communication_channel = source.communication_channel,
-            price_sensitivity = source.price_sensitivity,
-            last_profile_update = source.last_profile_update,
-            updated_at = source.updated_at
-    WHEN NOT MATCHED THEN
-        INSERT (customer_id, age, annual_income, customer_segment, state, city, zip_code,
-                days_since_last_purchase, total_orders, avg_order_value, churn_probability,
-                lifetime_value, primary_category, communication_channel, price_sensitivity,
-                last_profile_update, updated_at)
-        VALUES (source.customer_id, source.age, source.annual_income, source.customer_segment,
-                source.state, source.city, source.zip_code, source.days_since_last_purchase,
-                source.total_orders, source.avg_order_value, source.churn_probability,
-                source.lifetime_value, source.primary_category, source.communication_channel,
-                source.price_sensitivity, source.last_profile_update, source.updated_at);
+    -- Create a temporary staging table to read stream data ONCE
+    -- This prevents the stream from being consumed on the first read
+    CREATE OR REPLACE TEMPORARY TABLE TEMP_STREAM_DATA AS
+    SELECT 
+        parse_json(RAW_DATA) as JSON_DATA,
+        METADATA$ACTION as DML_ACTION
+    FROM PUBLIC.RAW_RETAIL_EVENTS_STREAM
+    WHERE METADATA$ACTION = 'INSERT';
+    
+    -- Insert customer profiles from temp table
+    INSERT INTO S2_BRONZE.STG_CUSTOMERS (
+        customer_id, age, annual_income, customer_segment, state, city, zip_code,
+        days_since_last_purchase, total_orders, avg_order_value, churn_probability,
+        lifetime_value, primary_category, communication_channel, price_sensitivity,
+        last_profile_update, updated_at
+    )
+    SELECT
+        JSON_DATA:customer_id::string as customer_id,
+        JSON_DATA:data.age::integer as age,
+        JSON_DATA:data.income::number as annual_income,
+        JSON_DATA:data.customer_segment::string as customer_segment,
+        JSON_DATA:data.location.state::string as state,
+        JSON_DATA:data.location.city::string as city,
+        JSON_DATA:data.location.zip_code::string as zip_code,
+        JSON_DATA:data.behavioral_metrics.days_since_last_purchase::integer as days_since_last_purchase,
+        JSON_DATA:data.behavioral_metrics.total_orders::integer as total_orders,
+        JSON_DATA:data.behavioral_metrics.avg_order_value::float as avg_order_value,
+        JSON_DATA:data.behavioral_metrics.churn_probability::float as churn_probability,
+        JSON_DATA:data.behavioral_metrics.lifetime_value::float as lifetime_value,
+        JSON_DATA:data.preferences.primary_category::string as primary_category,
+        JSON_DATA:data.preferences.communication_channel::string as communication_channel,
+        JSON_DATA:data.preferences.price_sensitivity::float as price_sensitivity,
+        JSON_DATA:timestamp::timestamp_ntz as last_profile_update,
+        CURRENT_TIMESTAMP() as updated_at
+    FROM TEMP_STREAM_DATA
+    WHERE JSON_DATA:event_type::string = 'customer_profile';
+    
+    customer_count := SQLROWCOUNT;
 
-    -- Transform purchases
+    -- Insert purchases from temp table
     INSERT INTO S2_BRONZE.STG_PURCHASES 
     SELECT 
-        EVENT_ID,
-        RAW_DATA:customer_id::STRING as customer_id,
-        RAW_DATA:data.order_id::STRING as order_id,
-        RAW_DATA:data.product_details.product_id::STRING as product_id,
-        RAW_DATA:data.product_details.category::STRING as product_category,
-        RAW_DATA:data.product_details.subcategory::STRING as product_subcategory,
-        RAW_DATA:data.product_details.brand::STRING as brand,
-        RAW_DATA:data.product_details.unit_price::FLOAT as unit_price,
-        RAW_DATA:data.product_details.quantity::INTEGER as quantity,
-        RAW_DATA:data.product_details.total_amount::FLOAT as line_total,
-        RAW_DATA:data.pricing.subtotal::FLOAT as subtotal,
-        RAW_DATA:data.pricing.discount_amount::FLOAT as discount_amount,
-        RAW_DATA:data.pricing.tax_amount::FLOAT as tax_amount,
-        RAW_DATA:data.pricing.shipping_cost::FLOAT as shipping_cost,
-        RAW_DATA:data.pricing.final_total::FLOAT as final_total,
-        RAW_DATA:data.channel.platform::STRING as sales_channel,
-        RAW_DATA:data.channel.device_type::STRING as device_type,
-        RAW_DATA:data.channel.payment_method::STRING as payment_method,
-        RAW_DATA:data.fulfillment.warehouse_id::STRING as warehouse_id,
-        RAW_DATA:data.fulfillment.shipping_method::STRING as shipping_method,
-        RAW_DATA:data.fulfillment.estimated_delivery::TIMESTAMP as estimated_delivery_date,
-        RAW_DATA:data.ml_features.customer_segment::STRING as customer_segment,
-        RAW_DATA:data.ml_features.is_repeat_customer::BOOLEAN as is_repeat_customer,
-        RAW_DATA:data.ml_features.cart_abandonment_risk::FLOAT as cart_abandonment_risk,
-        RAW_DATA:data.ml_features.return_probability::FLOAT as return_probability,
-        RAW_DATA:data.ml_features.upsell_potential::FLOAT as upsell_potential,
-        TIMESTAMP as purchase_timestamp,
+        JSON_DATA:event_id::STRING as event_id,
+        JSON_DATA:customer_id::STRING as customer_id,
+        JSON_DATA:data.order_id::STRING as order_id,
+        JSON_DATA:data.product_details.product_id::STRING as product_id,
+        JSON_DATA:data.product_details.category::STRING as product_category,
+        JSON_DATA:data.product_details.subcategory::STRING as product_subcategory,
+        JSON_DATA:data.product_details.brand::STRING as brand,
+        JSON_DATA:data.product_details.unit_price::FLOAT as unit_price,
+        JSON_DATA:data.product_details.quantity::INTEGER as quantity,
+        JSON_DATA:data.product_details.total_amount::FLOAT as line_total,
+        JSON_DATA:data.pricing.subtotal::FLOAT as subtotal,
+        JSON_DATA:data.pricing.discount_amount::FLOAT as discount_amount,
+        JSON_DATA:data.pricing.tax_amount::FLOAT as tax_amount,
+        JSON_DATA:data.pricing.shipping_cost::FLOAT as shipping_cost,
+        JSON_DATA:data.pricing.final_total::FLOAT as final_total,
+        JSON_DATA:data.channel.platform::STRING as sales_channel,
+        JSON_DATA:data.channel.device_type::STRING as device_type,
+        JSON_DATA:data.channel.payment_method::STRING as payment_method,
+        JSON_DATA:data.fulfillment.warehouse_id::STRING as warehouse_id,
+        JSON_DATA:data.fulfillment.shipping_method::STRING as shipping_method,
+        JSON_DATA:data.fulfillment.estimated_delivery::TIMESTAMP as estimated_delivery_date,
+        JSON_DATA:data.ml_features.customer_segment::STRING as customer_segment,
+        JSON_DATA:data.ml_features.is_repeat_customer::BOOLEAN as is_repeat_customer,
+        JSON_DATA:data.ml_features.cart_abandonment_risk::FLOAT as cart_abandonment_risk,
+        JSON_DATA:data.ml_features.return_probability::FLOAT as return_probability,
+        JSON_DATA:data.ml_features.upsell_potential::FLOAT as upsell_potential,
+        JSON_DATA:timestamp::timestamp_ntz as purchase_timestamp,
         CURRENT_TIMESTAMP() as created_at,
         CURRENT_TIMESTAMP() as updated_at
-    FROM S1_RAW_DATA.RAW_RETAIL_EVENTS_STREAM
-    WHERE EVENT_TYPE = 'purchase'
-        AND METADATA$ACTION = 'INSERT';
+    FROM TEMP_STREAM_DATA
+    WHERE JSON_DATA:event_type::string = 'purchase';
+    
+    purchase_count := SQLROWCOUNT;
+    
+    -- Clean up temp table
+    DROP TABLE IF EXISTS TEMP_STREAM_DATA;
         
-    RETURN 'Bronze transformation completed successfully';
+    RETURN 'Bronze transformation completed: ' || customer_count || ' customers, ' || purchase_count || ' purchases';
 END;
 $$;
 
@@ -1090,101 +1652,81 @@ LANGUAGE SQL
 AS
 $$
 BEGIN
-    -- Transform to customer dimension
-    MERGE INTO S3_GOLD.DIM_CUSTOMERS AS target
-    USING (
-        SELECT 
-            customer_id,
-            customer_segment,
-            age,
-            CASE 
-                WHEN age BETWEEN 18 AND 25 THEN '18-25'
-                WHEN age BETWEEN 26 AND 35 THEN '26-35'
-                WHEN age BETWEEN 36 AND 45 THEN '36-45'
-                WHEN age BETWEEN 46 AND 55 THEN '46-55'
-                WHEN age BETWEEN 56 AND 65 THEN '56-65'
-                ELSE '65+'
-            END as age_group,
-            annual_income,
-            CASE 
-                WHEN annual_income < 30000 THEN 'Low Income'
-                WHEN annual_income BETWEEN 30000 AND 60000 THEN 'Middle Income'
-                WHEN annual_income BETWEEN 60001 AND 100000 THEN 'Upper Middle Income'
-                ELSE 'High Income'
-            END as income_bracket,
-            state,
-            city,
-            primary_category,
-            communication_channel,
-            price_sensitivity,
-            total_orders,
-            total_orders * avg_order_value as total_spent,
-            avg_order_value,
-            NULL as first_purchase_date,
-            NULL as last_purchase_date,
-            COALESCE(days_since_last_purchase, 0) as customer_tenure_days,
-            0 as annual_purchase_frequency,
-            'web' as preferred_sales_channel,
-            'credit_card' as preferred_payment_method,
-            CASE 
-                WHEN avg_order_value >= 100 THEN 'High Value'
-                WHEN avg_order_value >= 50 THEN 'Medium Value'
-                ELSE 'Low Value'
-            END as value_segment,
-            CASE 
-                WHEN days_since_last_purchase <= 30 THEN 'Highly Engaged'
-                WHEN days_since_last_purchase <= 90 THEN 'Moderately Engaged'
-                ELSE 'At Risk'
-            END as engagement_level,
-            churn_probability,
-            lifetime_value,
-            CASE 
-                WHEN total_orders >= 5 THEN 'Loyal'
-                WHEN total_orders >= 2 THEN 'Repeat'
-                ELSE 'New'
-            END as loyalty_tier,
-            'Digital Adopter' as digital_adoption_level,
-            CURRENT_TIMESTAMP() as updated_at
-        FROM S2_BRONZE.STG_CUSTOMERS
-    ) AS source
-    ON target.customer_id = source.customer_id
-    WHEN MATCHED THEN
-        UPDATE SET
-            customer_segment = source.customer_segment,
-            age = source.age,
-            age_group = source.age_group,
-            annual_income = source.annual_income,
-            income_bracket = source.income_bracket,
-            state = source.state,
-            city = source.city,
-            primary_category = source.primary_category,
-            communication_channel = source.communication_channel,
-            price_sensitivity = source.price_sensitivity,
-            total_orders = source.total_orders,
-            total_spent = source.total_spent,
-            avg_order_value = source.avg_order_value,
-            customer_tenure_days = source.customer_tenure_days,
-            value_segment = source.value_segment,
-            engagement_level = source.engagement_level,
-            churn_probability = source.churn_probability,
-            lifetime_value = source.lifetime_value,
-            loyalty_tier = source.loyalty_tier,
-            updated_at = source.updated_at
-    WHEN NOT MATCHED THEN
-        INSERT (customer_id, customer_segment, age, age_group, annual_income, income_bracket,
-                state, city, primary_category, communication_channel, price_sensitivity,
-                total_orders, total_spent, avg_order_value, customer_tenure_days,
-                preferred_sales_channel, preferred_payment_method, value_segment,
-                engagement_level, churn_probability, lifetime_value, loyalty_tier,
-                digital_adoption_level, updated_at)
-        VALUES (source.customer_id, source.customer_segment, source.age, source.age_group,
-                source.annual_income, source.income_bracket, source.state, source.city,
-                source.primary_category, source.communication_channel, source.price_sensitivity,
-                source.total_orders, source.total_spent, source.avg_order_value,
-                source.customer_tenure_days, source.preferred_sales_channel,
-                source.preferred_payment_method, source.value_segment, source.engagement_level,
-                source.churn_probability, source.lifetime_value, source.loyalty_tier,
-                source.digital_adoption_level, source.updated_at);
+    -- Insert new customer dimension records (append-only from latest bronze profiles)
+    -- Only insert customers that don't already exist in the gold layer
+    INSERT INTO S3_GOLD.DIM_CUSTOMERS (
+        customer_id, customer_segment, age, age_group, annual_income, income_bracket,
+        state, city, primary_category, communication_channel, price_sensitivity,
+        total_orders, total_spent, avg_order_value, first_purchase_date, last_purchase_date,
+        customer_tenure_days, annual_purchase_frequency, preferred_sales_channel,
+        preferred_payment_method, value_segment, engagement_level, churn_probability,
+        lifetime_value, loyalty_tier, digital_adoption_level, updated_at
+    )
+    SELECT 
+        customer_id,
+        customer_segment,
+        age,
+        CASE 
+            WHEN age BETWEEN 18 AND 25 THEN '18-25'
+            WHEN age BETWEEN 26 AND 35 THEN '26-35'
+            WHEN age BETWEEN 36 AND 45 THEN '36-45'
+            WHEN age BETWEEN 46 AND 55 THEN '46-55'
+            WHEN age BETWEEN 56 AND 65 THEN '56-65'
+            ELSE '65+'
+        END as age_group,
+        annual_income,
+        CASE 
+            WHEN annual_income < 30000 THEN 'Low Income'
+            WHEN annual_income BETWEEN 30000 AND 60000 THEN 'Middle Income'
+            WHEN annual_income BETWEEN 60001 AND 100000 THEN 'Upper Middle Income'
+            ELSE 'High Income'
+        END as income_bracket,
+        state,
+        city,
+        primary_category,
+        communication_channel,
+        price_sensitivity,
+        total_orders,
+        total_orders * avg_order_value as total_spent,
+        avg_order_value,
+        NULL as first_purchase_date,
+        NULL as last_purchase_date,
+        COALESCE(days_since_last_purchase, 0) as customer_tenure_days,
+        0 as annual_purchase_frequency,
+        'web' as preferred_sales_channel,
+        'credit_card' as preferred_payment_method,
+        CASE 
+            WHEN avg_order_value >= 100 THEN 'High Value'
+            WHEN avg_order_value >= 50 THEN 'Medium Value'
+            ELSE 'Low Value'
+        END as value_segment,
+        CASE 
+            WHEN days_since_last_purchase <= 30 THEN 'Highly Engaged'
+            WHEN days_since_last_purchase <= 90 THEN 'Moderately Engaged'
+            ELSE 'At Risk'
+        END as engagement_level,
+        churn_probability,
+        lifetime_value,
+        CASE 
+            WHEN total_orders >= 5 THEN 'Loyal'
+            WHEN total_orders >= 2 THEN 'Repeat'
+            ELSE 'New'
+        END as loyalty_tier,
+        'Digital Adopter' as digital_adoption_level,
+        CURRENT_TIMESTAMP() as updated_at
+    FROM (
+        -- Get the latest profile for each customer from bronze layer
+        SELECT *
+        FROM (
+            SELECT *,
+                   ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY last_profile_update DESC) as rn
+            FROM S2_BRONZE.STG_CUSTOMERS
+        ) ranked
+        WHERE rn = 1
+    ) latest_profiles
+    WHERE customer_id NOT IN (
+        SELECT customer_id FROM S3_GOLD.DIM_CUSTOMERS
+    );
 
     -- Transform to sales fact
     INSERT INTO S3_GOLD.FCT_SALES
@@ -1220,6 +1762,522 @@ BEGIN
     
     RETURN 'Gold transformation completed successfully';
 END;
+$$;
+
+-- =============================================================================
+-- STEP 7B: CREATE HISTORICAL DATA GENERATION PROCEDURE
+-- =============================================================================
+
+-- Historical data generation procedure for the last 3 years
+CREATE OR REPLACE PROCEDURE GENERATE_HISTORICAL_DATA(
+    START_DATE DATE DEFAULT DATEADD('year', -3, CURRENT_DATE()),
+    END_DATE DATE DEFAULT CURRENT_DATE(),
+    EVENTS_PER_DAY INTEGER DEFAULT 100
+)
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python', 'faker', 'numpy', 'scipy')
+HANDLER = 'main'
+COMMENT = 'Generates 3 years of historical retail data with realistic patterns and customer evolution'
+AS
+$$
+import random
+import json
+from datetime import datetime, timedelta, date
+from typing import Dict, List, Any, Optional
+import time
+
+# Snowpark imports
+from snowflake.snowpark import Session
+from snowflake.snowpark.functions import col, lit, current_timestamp
+from snowflake.snowpark.types import StructType, StructField, StringType, IntegerType, FloatType, TimestampType, VariantType
+
+# Third-party libraries
+import numpy as np
+from faker import Faker
+from scipy import stats
+
+
+class HistoricalRetailDataGenerator:
+    """Generates historical retail data with realistic patterns over multiple years."""
+    
+    def __init__(self, session: Session):
+        self.session = session
+        self.fake = Faker()
+        Faker.seed(42)  # Fixed seed for consistent generation
+        
+        # Load configuration from reference tables
+        self._load_reference_data()
+        
+        # Historical customer evolution tracking
+        self.historical_customers = {}
+        self.customer_join_dates = {}
+        self.customer_churn_dates = {}
+        
+    def _load_reference_data(self):
+        """Load configuration data from reference tables."""
+        # Load customer segments
+        segments_df = self.session.table("RETAIL_STREAMING_DEMO.REFERENCE_DATA.CUSTOMER_SEGMENTS").collect()
+        self.customer_segments = {}
+        for row in segments_df:
+            self.customer_segments[row['SEGMENT_NAME']] = {
+                "weight": row['WEIGHT'],
+                "avg_order_value": row['AVG_ORDER_VALUE'],
+                "purchase_frequency": row['PURCHASE_FREQUENCY']
+            }
+        
+        # Load product categories
+        categories_df = self.session.table("RETAIL_STREAMING_DEMO.REFERENCE_DATA.PRODUCT_CATEGORIES").collect()
+        self.product_categories = {}
+        for row in categories_df:
+            self.product_categories[row['CATEGORY_NAME']] = {
+                "seasonal_peak": json.loads(row['SEASONAL_PEAK_MONTHS']),
+                "margin": row['MARGIN_RATE'],
+                "return_rate": row['RETURN_RATE']
+            }
+        
+        # Load warehouses
+        warehouses_df = self.session.table("RETAIL_STREAMING_DEMO.REFERENCE_DATA.WAREHOUSES").collect()
+        self.warehouses = []
+        for row in warehouses_df:
+            self.warehouses.append({
+                "id": row['WAREHOUSE_ID'],
+                "location": row['LOCATION_NAME'],
+                "capacity": row['CAPACITY']
+            })
+        
+        # Load marketing channels
+        channels_df = self.session.table("RETAIL_STREAMING_DEMO.REFERENCE_DATA.MARKETING_CHANNELS").collect()
+        self.marketing_channels = {}
+        for row in channels_df:
+            self.marketing_channels[row['CHANNEL_NAME']] = {
+                "cost_per_acquisition": row['COST_PER_ACQUISITION'],
+                "conversion_rate": row['CONVERSION_RATE'],
+                "engagement_rate": row['ENGAGEMENT_RATE']
+            }
+        
+        # Load customer lifecycle configuration
+        lifecycle_df = self.session.table("RETAIL_STREAMING_DEMO.REFERENCE_DATA.CUSTOMER_LIFECYCLE").collect()
+        self.customer_lifecycle = {}
+        for row in lifecycle_df:
+            self.customer_lifecycle[row['CUSTOMER_TYPE']] = {
+                "min_epoch": row['MIN_CUSTOMER_ID_EPOCH'],
+                "max_epoch": row['MAX_CUSTOMER_ID_EPOCH'],
+                "customer_count": row['CUSTOMER_COUNT'],
+                "is_active": row['IS_ACTIVE'],
+                "churn_probability": row['CHURN_PROBABILITY']
+            }
+        
+        # Load generation parameters
+        params_df = self.session.table("RETAIL_STREAMING_DEMO.REFERENCE_DATA.GENERATION_PARAMETERS").collect()
+        self.params = {}
+        for row in params_df:
+            param_name = row['PARAMETER_NAME']
+            param_value = row['PARAMETER_VALUE']
+            param_type = row['PARAMETER_TYPE']
+            
+            # Handle VARIANT values properly
+            if param_type == 'NUMBER':
+                if isinstance(param_value, str):
+                    clean_value = param_value.strip('"')
+                    self.params[param_name] = float(clean_value)
+                else:
+                    self.params[param_name] = float(param_value)
+            elif param_type == 'BOOLEAN':
+                if isinstance(param_value, str):
+                    clean_value = param_value.strip('"').lower()
+                    self.params[param_name] = clean_value in ('true', '1', 'yes')
+                else:
+                    self.params[param_name] = bool(param_value)
+            elif param_type == 'ARRAY':
+                if isinstance(param_value, str):
+                    self.params[param_name] = json.loads(param_value)
+                else:
+                    self.params[param_name] = json.loads(str(param_value))
+            elif param_type == 'OBJECT':
+                if isinstance(param_value, str):
+                    self.params[param_name] = json.loads(param_value)
+                else:
+                    self.params[param_name] = json.loads(str(param_value))
+            else:  # STRING
+                if isinstance(param_value, str):
+                    self.params[param_name] = param_value.strip('"')
+                else:
+                    self.params[param_name] = str(param_value)
+    
+    def _get_seasonal_multiplier(self, date_obj: datetime, category: str) -> float:
+        """Get seasonal multiplier for a given date and category."""
+        month = date_obj.month
+        peak_months = self.product_categories.get(category, {}).get("seasonal_peak", [])
+        
+        if month in peak_months:
+            return random.uniform(1.8, 2.5)  # Peak season
+        elif month in [(m + 1) % 12 or 12 for m in peak_months]:
+            return random.uniform(1.2, 1.6)  # Pre/post peak
+        else:
+            return random.uniform(0.6, 1.0)  # Off season
+    
+    def _get_yearly_growth_multiplier(self, date_obj: datetime, start_date: datetime) -> float:
+        """Get growth multiplier based on years since start."""
+        years_elapsed = (date_obj - start_date).days / 365.25
+        # Simulate business growth: 15% year-over-year growth
+        return (1.15 ** years_elapsed)
+    
+    def _get_day_of_week_multiplier(self, date_obj: datetime) -> float:
+        """Get multiplier based on day of week (higher on weekends)."""
+        day_of_week = date_obj.weekday()  # 0=Monday, 6=Sunday
+        multipliers = {
+            0: 0.8,   # Monday
+            1: 0.9,   # Tuesday
+            2: 0.9,   # Wednesday
+            3: 1.0,   # Thursday
+            4: 1.2,   # Friday
+            5: 1.4,   # Saturday
+            6: 1.3    # Sunday
+        }
+        return multipliers.get(day_of_week, 1.0)
+    
+    def _evolve_customer_base(self, current_date: datetime):
+        """Evolve the customer base for a given date - add new customers and churn existing ones."""
+        current_epoch = int(current_date.timestamp())
+        
+        # Add new customers based on business growth
+        years_since_start = (current_date.year - 2022)  # Assuming we start from 2022
+        base_new_customers_per_day = 5
+        growth_adjusted_new_customers = int(base_new_customers_per_day * (1.2 ** years_since_start))
+        
+        # Add seasonal variation to new customer acquisition
+        seasonal_multiplier = 1.0
+        if current_date.month in [11, 12, 1]:  # Holiday season
+            seasonal_multiplier = 1.5
+        elif current_date.month in [6, 7, 8]:  # Summer
+            seasonal_multiplier = 1.2
+        
+        new_customers_today = int(growth_adjusted_new_customers * seasonal_multiplier * random.uniform(0.7, 1.3))
+        
+        # Generate new customers
+        for _ in range(new_customers_today):
+            # Find next available epoch-based ID to avoid collisions
+            base_epoch = current_epoch
+            customer_id = f"CUST_{base_epoch}"
+            
+            # If ID already exists, increment epoch until we find an unused one
+            while customer_id in self.historical_customers:
+                base_epoch += 1
+                customer_id = f"CUST_{base_epoch}"
+            
+            # New customers start as occasional, may upgrade over time
+            if customer_id not in self.historical_customers:
+                segment_weights = [0.05, 0.35, 0.60]  # Favor occasional for new customers
+                segment = np.random.choice(list(self.customer_segments.keys()), p=segment_weights)
+                
+                self.historical_customers[customer_id] = {
+                    "customer_id": customer_id,
+                    "segment": segment,
+                    "join_date": current_date,
+                    "is_active": True,
+                    "total_orders": 0,
+                    "total_spent": 0.0,
+                    "last_purchase_date": None
+                }
+                self.customer_join_dates[customer_id] = current_date
+        
+        # Churn some existing customers
+        active_customers = [cid for cid, customer in self.historical_customers.items() 
+                          if customer["is_active"] and cid not in self.customer_churn_dates]
+        
+        for customer_id in active_customers:
+            customer = self.historical_customers[customer_id]
+            days_since_join = (current_date - customer["join_date"]).days
+            
+            # Base churn probability increases with time since last purchase
+            days_since_last_purchase = 0
+            if customer["last_purchase_date"]:
+                days_since_last_purchase = (current_date - customer["last_purchase_date"]).days
+            else:
+                days_since_last_purchase = days_since_join
+            
+            # Churn probability based on segment and recency
+            base_churn_rates = {"premium": 0.0001, "regular": 0.0003, "occasional": 0.0008}
+            base_churn = base_churn_rates.get(customer["segment"], 0.0005)
+            
+            # Increase churn probability with days since last purchase
+            recency_multiplier = min(10.0, 1.0 + (days_since_last_purchase / 30.0))
+            daily_churn_prob = base_churn * recency_multiplier
+            
+            if random.random() < daily_churn_prob:
+                customer["is_active"] = False
+                self.customer_churn_dates[customer_id] = current_date
+    
+    def _get_active_customers_for_date(self, current_date: datetime) -> List[str]:
+        """Get list of active customer IDs for a given date."""
+        active_customers = []
+        for customer_id, customer in self.historical_customers.items():
+            join_date = self.customer_join_dates.get(customer_id, customer["join_date"])
+            churn_date = self.customer_churn_dates.get(customer_id)
+            
+            # Customer is active if they've joined and haven't churned yet
+            if join_date <= current_date and (churn_date is None or churn_date > current_date):
+                active_customers.append(customer_id)
+        
+        return active_customers
+    
+    def generate_historical_events(self, start_date: date, end_date: date, events_per_day: int) -> List[Dict[str, Any]]:
+        """Generate historical events for the specified date range."""
+        all_events = []
+        current_date = datetime.combine(start_date, datetime.min.time())
+        end_datetime = datetime.combine(end_date, datetime.min.time())
+        
+        # Initialize with some core loyal customers from the beginning
+        core_config = self.customer_lifecycle.get('CORE_LOYAL', {})
+        core_count = min(1000, core_config.get('customer_count', 3500))  # Start with subset
+        core_min_epoch = core_config.get('min_epoch', 1000000000)
+        
+        # Add initial core customers
+        for i in range(core_count):
+            customer_epoch = core_min_epoch + (i * 100)  # Spread them out
+            customer_id = f"CUST_{customer_epoch}"
+            
+            # Use epoch as seed for consistent attributes
+            np.random.seed(customer_epoch % 2147483647)
+            
+            segment_weights = [seg["weight"] for seg in self.customer_segments.values()]
+            segment = np.random.choice(list(self.customer_segments.keys()), p=segment_weights)
+            
+            self.historical_customers[customer_id] = {
+                "customer_id": customer_id,
+                "segment": segment,
+                "join_date": current_date - timedelta(days=random.randint(0, 365)),  # Some history
+                "is_active": True,
+                "total_orders": 0,
+                "total_spent": 0.0,
+                "last_purchase_date": None
+            }
+            self.customer_join_dates[customer_id] = self.historical_customers[customer_id]["join_date"]
+        
+        # Reset random seed
+        np.random.seed(None)
+        
+        # Generate events day by day
+        while current_date <= end_datetime:
+            # Evolve customer base for this date
+            self._evolve_customer_base(current_date)
+            
+            # Get active customers for this date
+            active_customers = self._get_active_customers_for_date(current_date)
+            
+            if not active_customers:
+                current_date += timedelta(days=1)
+                continue
+            
+            # Calculate events for this day with various multipliers
+            base_events = events_per_day
+            growth_multiplier = self._get_yearly_growth_multiplier(current_date, datetime.combine(start_date, datetime.min.time()))
+            day_multiplier = self._get_day_of_week_multiplier(current_date)
+            
+            # Scale events based on customer count for this date
+            customer_count_multiplier = len(active_customers) / 1000.0  # Normalize to initial 1000 customers
+            customer_count_multiplier = max(0.1, min(3.0, customer_count_multiplier))  # Bound between 10% and 300%
+            
+            # Add some randomness
+            random_multiplier = random.uniform(0.7, 1.3)
+            
+            total_events_today = int(base_events * growth_multiplier * day_multiplier * customer_count_multiplier * random_multiplier)
+            
+            # Generate events for this day
+            for _ in range(total_events_today):
+                # Select random customer
+                customer_id = random.choice(active_customers)
+                customer = self.historical_customers[customer_id]
+                
+                # Generate purchase event
+                event_time = current_date + timedelta(
+                    hours=random.randint(8, 22),  # Business hours
+                    minutes=random.randint(0, 59),
+                    seconds=random.randint(0, 59)
+                )
+                
+                # Select category with seasonal influence
+                category = random.choice(list(self.product_categories.keys()))
+                seasonal_multiplier = self._get_seasonal_multiplier(current_date, category)
+                
+                # Generate purchase details
+                segment_data = self.customer_segments[customer["segment"]]
+                base_price = segment_data["avg_order_value"] * random.uniform(0.5, 2.0)
+                final_price = base_price * seasonal_multiplier
+                
+                quantity = max(1, int(np.random.poisson(2)))
+                subtotal = round(final_price * quantity, 2)
+                
+                # Apply discounts based on segment and season
+                discount_prob = {"premium": 0.1, "regular": 0.25, "occasional": 0.4}[customer["segment"]]
+                discount_amount = 0
+                if random.random() < discount_prob:
+                    discount_amount = subtotal * random.uniform(0.05, 0.20)
+                
+                tax_amount = round((subtotal - discount_amount) * 0.08, 2)
+                shipping_cost = round(random.uniform(0, 15), 2)
+                final_total = round(subtotal - discount_amount + tax_amount + shipping_cost, 2)
+                
+                # Update customer stats
+                customer["total_orders"] += 1
+                customer["total_spent"] += final_total
+                customer["last_purchase_date"] = current_date
+                
+                # Create purchase event
+                purchase_event = {
+                    "event_id": f"HIST_PURCH_{int(event_time.timestamp())}_{random.randint(1000, 9999)}",
+                    "customer_id": customer_id,
+                    "event_type": "purchase",
+                    "timestamp": event_time.isoformat(),
+                    "data": {
+                        "order_id": f"ORD_{int(event_time.timestamp())}_{random.randint(1000, 9999)}",
+                        "product_details": {
+                            "product_id": f"{category.upper()[:3]}_{random.randint(1000, 9999)}",
+                            "category": category,
+                            "subcategory": self.fake.word(),
+                            "brand": self.fake.company(),
+                            "unit_price": round(final_price, 2),
+                            "quantity": quantity,
+                            "total_amount": subtotal
+                        },
+                        "pricing": {
+                            "subtotal": subtotal,
+                            "discount_amount": round(discount_amount, 2),
+                            "tax_amount": tax_amount,
+                            "shipping_cost": shipping_cost,
+                            "final_total": final_total
+                        },
+                        "channel": {
+                            "platform": random.choice(["web", "mobile_app", "in_store", "phone"]),
+                            "device_type": random.choice(["desktop", "mobile", "tablet", "pos"]),
+                            "payment_method": random.choice(["credit_card", "debit_card", "paypal", "apple_pay", "cash"])
+                        },
+                        "fulfillment": {
+                            "warehouse_id": random.choice([wh["id"] for wh in self.warehouses]),
+                            "shipping_method": random.choice(["standard", "express", "overnight", "pickup"]),
+                            "estimated_delivery": (event_time + timedelta(days=random.randint(1, 7))).isoformat()
+                        },
+                        "ml_features": {
+                            "customer_segment": customer["segment"],
+                            "is_repeat_customer": customer["total_orders"] > 1,
+                            "cart_abandonment_risk": round(random.uniform(0, 1), 3),
+                            "return_probability": round(self.product_categories[category]["return_rate"] * random.uniform(0.5, 1.5), 3),
+                            "upsell_potential": round(random.uniform(0, 1), 3)
+                        }
+                    }
+                }
+                all_events.append(purchase_event)
+                
+                # Occasionally generate customer profile events
+                if random.random() < 0.1:  # 10% chance
+                    customer_event = {
+                        "event_id": f"HIST_CUST_{int(event_time.timestamp())}_{random.randint(1000, 9999)}",
+                        "customer_id": customer_id,
+                        "event_type": "customer_profile",
+                        "timestamp": event_time.isoformat(),
+                        "data": {
+                            "customer_segment": customer["segment"],
+                            "age": random.randint(25, 65),
+                            "income": int(np.random.lognormal(11.0, 0.4)),
+                            "location": {
+                                "state": self.fake.state(),
+                                "city": self.fake.city(),
+                                "zip_code": self.fake.zipcode()
+                            },
+                            "behavioral_metrics": {
+                                "days_since_last_purchase": 0,
+                                "total_orders": customer["total_orders"],
+                                "avg_order_value": round(customer["total_spent"] / max(1, customer["total_orders"]), 2),
+                                "churn_probability": round(random.uniform(0.01, 0.3), 4),
+                                "lifetime_value": round(customer["total_spent"], 2)
+                            },
+                            "preferences": {
+                                "primary_category": category,
+                                "communication_channel": random.choice(["email", "sms", "push", "mail"]),
+                                "price_sensitivity": round(random.uniform(0.1, 1.0), 2)
+                            }
+                        }
+                    }
+                    all_events.append(customer_event)
+            
+            current_date += timedelta(days=1)
+        
+        return all_events
+
+
+def main(session: Session, start_date: date = None, end_date: date = None, events_per_day: int = 100) -> str:
+    """Main function for the historical data generation stored procedure."""
+    import uuid
+    import time as time_module
+    
+    # Set default dates if not provided
+    if start_date is None:
+        start_date = date.today() - timedelta(days=3*365)  # 3 years ago
+    if end_date is None:
+        end_date = date.today()
+    
+    run_id = str(uuid.uuid4())
+    start_time = time_module.time()
+    execution_status = 'FAILED'
+    error_message = None
+    events_generated = 0
+    
+    try:
+        generator = HistoricalRetailDataGenerator(session)
+        
+        # Generate historical events
+        all_events = generator.generate_historical_events(start_date, end_date, events_per_day)
+        events_generated = len(all_events)
+        
+        if all_events:
+            # Create schema for the events
+            schema = StructType([
+                StructField("EVENT_ID", StringType()),
+                StructField("EVENT_TYPE", StringType()),
+                StructField("TIMESTAMP", TimestampType()),
+                StructField("RAW_DATA", VariantType()),
+                StructField("CREATED_AT", TimestampType())
+            ])
+            
+            # Process events in batches to avoid memory issues
+            batch_size = 10000
+            total_batches = (len(all_events) + batch_size - 1) // batch_size
+            
+            for batch_num in range(total_batches):
+                start_idx = batch_num * batch_size
+                end_idx = min((batch_num + 1) * batch_size, len(all_events))
+                batch_events = all_events[start_idx:end_idx]
+                
+                df_data = []
+                for event in batch_events:
+                    df_data.append([
+                        event["event_id"],
+                        event["event_type"],
+                        event["timestamp"],
+                        json.dumps(event),
+                        datetime.utcnow().isoformat()
+                    ])
+                
+                df = session.create_dataframe(df_data, schema)
+                df.write.mode("append").save_as_table("S1_RAW_DATA.RAW_RETAIL_EVENTS")
+            
+            execution_status = 'SUCCESS'
+        else:
+            execution_status = 'PARTIAL'
+            error_message = 'No events generated'
+            
+    except Exception as e:
+        execution_status = 'FAILED'
+        error_message = str(e)
+    
+    execution_time = time_module.time() - start_time
+    
+    if execution_status == 'SUCCESS':
+        return f"Successfully generated {events_generated} historical events from {start_date} to {end_date} (Run ID: {run_id}, Time: {execution_time:.2f}s)"
+    else:
+        return f"Historical generation {execution_status.lower()}: {error_message} (Run ID: {run_id})"
 $$;
 
 -- =============================================================================
@@ -1261,10 +2319,16 @@ LANGUAGE SQL
 AS
 $$
 BEGIN
-  -- Resume tasks (will succeed if suspended, or give informative error if already running)
-  ALTER TASK DATA_GENERATION_TASK RESUME;
-  ALTER TASK BRONZE_TRANSFORMATION_TASK RESUME;
+  -- First, suspend all tasks to ensure clean state (this allows task graph modifications)
+  ALTER TASK IF EXISTS DATA_GENERATION_TASK SUSPEND;
+  ALTER TASK IF EXISTS BRONZE_TRANSFORMATION_TASK SUSPEND;
+  ALTER TASK IF EXISTS GOLD_TRANSFORMATION_TASK SUSPEND;
+  
+  -- Resume tasks in reverse dependency order (leaf to root)
+  -- This ensures child tasks are ready before parent tasks start
   ALTER TASK GOLD_TRANSFORMATION_TASK RESUME;
+  ALTER TASK BRONZE_TRANSFORMATION_TASK RESUME;
+  ALTER TASK DATA_GENERATION_TASK RESUME;  -- Root task last
   
   RETURN 'Pipeline started successfully! Data will be generated every 30 minutes.';
 END;
@@ -1282,22 +2346,6 @@ BEGIN
   ALTER TASK GOLD_TRANSFORMATION_TASK SUSPEND;
   RETURN 'Pipeline stopped successfully';
 END;
-$$;
-
--- Check pipeline status
-CREATE OR REPLACE PROCEDURE CHECK_PIPELINE_STATUS()
-RETURNS TABLE (TASK_NAME STRING, STATE STRING, LAST_RUN TIMESTAMP_LTZ)
-LANGUAGE SQL
-AS
-$$
-  SELECT 
-    name as task_name,
-    state,
-    last_committed_on as last_run
-  FROM information_schema.tasks
-  WHERE task_schema = 'RAW_DATA'
-    AND name IN ('DATA_GENERATION_TASK', 'BRONZE_TRANSFORMATION_TASK', 'GOLD_TRANSFORMATION_TASK')
-  ORDER BY name;
 $$;
 
 -- Data summary function (UDF)
@@ -1370,6 +2418,18 @@ $$
          object_construct('location', location_name, 'capacity', capacity) as value,
          description
   FROM REFERENCE_DATA.WAREHOUSES
+  
+  UNION ALL
+  
+  -- Customer Lifecycle
+  SELECT 'Customer Lifecycle' as section, '' as name, null as value, '' as description
+  UNION ALL
+  SELECT 'LIFECYCLE' as section, customer_type as name,
+         object_construct('min_epoch', min_customer_id_epoch, 'max_epoch', max_customer_id_epoch, 
+                         'customer_count', customer_count, 'is_active', is_active, 
+                         'churn_probability', churn_probability) as value,
+         description
+  FROM REFERENCE_DATA.CUSTOMER_LIFECYCLE
   
   ORDER BY section, name
 $$;
@@ -1460,6 +2520,80 @@ $$
     WHERE RUN_ID = RUN_ID_INPUT AND (COMPONENT = 'ALL' OR COMPONENT = 'GENERATION_PARAMETERS');
 $$;
 
+-- Procedure to generate historical data for specific date ranges
+CREATE OR REPLACE PROCEDURE GENERATE_HISTORICAL_DATA_RANGE(
+    START_DATE_STR STRING,
+    END_DATE_STR STRING,
+    EVENTS_PER_DAY INTEGER DEFAULT 100
+)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    CALL GENERATE_HISTORICAL_DATA(TO_DATE(START_DATE_STR, 'YYYY-MM-DD'), TO_DATE(END_DATE_STR, 'YYYY-MM-DD'), EVENTS_PER_DAY);
+    RETURN CONCAT('Historical data generation initiated for ', START_DATE_STR, ' to ', END_DATE_STR);
+END;
+$$;
+
+-- Procedure to generate sample historical data (last 30 days)
+CREATE OR REPLACE PROCEDURE GENERATE_SAMPLE_HISTORICAL_DATA()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    CALL GENERATE_HISTORICAL_DATA(DATEADD('day', -30, CURRENT_DATE()), CURRENT_DATE(), 50);
+    RETURN 'Sample historical data generation (last 30 days) initiated';
+END;
+$$;
+
+-- Function to analyze historical data patterns
+CREATE OR REPLACE FUNCTION ANALYZE_HISTORICAL_PATTERNS()
+RETURNS TABLE (
+    METRIC STRING, 
+    TIME_PERIOD STRING, 
+    VALUE FLOAT, 
+    DESCRIPTION STRING
+)
+AS
+$$
+    -- Daily event volume trends
+    SELECT 'Daily Events' as METRIC, 
+           TO_CHAR(DATE(TIMESTAMP), 'YYYY-MM-DD') as TIME_PERIOD,
+           COUNT(*)::FLOAT as VALUE,
+           'Number of events per day' as DESCRIPTION
+    FROM S1_RAW_DATA.RAW_RETAIL_EVENTS 
+    WHERE TIMESTAMP >= DATEADD('day', -30, CURRENT_DATE())
+    GROUP BY DATE(TIMESTAMP)
+    
+    UNION ALL
+    
+    -- Weekly revenue trends
+    SELECT 'Weekly Revenue' as METRIC,
+           TO_CHAR(DATE_TRUNC('week', DATE(TIMESTAMP)), 'YYYY-MM-DD') as TIME_PERIOD,
+           SUM(RAW_DATA:data.pricing.final_total::FLOAT) as VALUE,
+           'Total revenue per week' as DESCRIPTION
+    FROM S1_RAW_DATA.RAW_RETAIL_EVENTS 
+    WHERE EVENT_TYPE = 'purchase' 
+      AND TIMESTAMP >= DATEADD('day', -30, CURRENT_DATE())
+    GROUP BY DATE_TRUNC('week', DATE(TIMESTAMP))
+    
+    UNION ALL
+    
+    -- Customer acquisition trends
+    SELECT 'New Customers' as METRIC,
+           TO_CHAR(DATE(TIMESTAMP), 'YYYY-MM-DD') as TIME_PERIOD,
+           COUNT(DISTINCT RAW_DATA:customer_id::STRING) as VALUE,
+           'Unique customers per day' as DESCRIPTION
+    FROM S1_RAW_DATA.RAW_RETAIL_EVENTS 
+    WHERE EVENT_TYPE = 'customer_profile_update'
+      AND TIMESTAMP >= DATEADD('day', -30, CURRENT_DATE())
+    GROUP BY DATE(TIMESTAMP)
+    
+    ORDER BY METRIC, TIME_PERIOD
+$$;
+
 -- =============================================================================
 -- SETUP COMPLETE!
 -- =============================================================================
@@ -1468,18 +2602,35 @@ SELECT '🎉 SETUP COMPLETE! 🎉' as message;
 SELECT 'Run the following commands to start your streaming pipeline:' as instructions;
 SELECT '1. CALL START_PIPELINE();                    -- Start automated data generation' as step_1;
 SELECT '2. CALL GENERATE_RETAIL_DATA(20, 50, 15, 10); -- Generate initial data batch' as step_2;
-SELECT '3. CALL CHECK_PIPELINE_STATUS();             -- Check if tasks are running' as step_3;
 SELECT '4. SELECT * FROM TABLE(DATA_SUMMARY());      -- View data across all layers' as step_4;
 SELECT '5. SELECT * FROM TABLE(VIEW_REFERENCE_CONFIG()); -- View configuration parameters' as step_5;
-SELECT '' as separator;
+SELECT '' as separator_1;
+SELECT '📊 HISTORICAL DATA GENERATION OPTIONS:' as historical_options;
+SELECT '6. CALL GENERATE_SAMPLE_HISTORICAL_DATA();   -- Generate 30 days of sample data' as step_6;
+SELECT '7. CALL GENERATE_HISTORICAL_DATA_RANGE(''2022-01-01'', ''2024-12-31'', 150); -- Generate 3 years of data' as step_7;
+SELECT '8. CALL GENERATE_HISTORICAL_DATA();          -- Generate 3 years with default settings' as step_8;
+SELECT '9. SELECT * FROM TABLE(ANALYZE_HISTORICAL_PATTERNS()); -- Analyze historical trends' as step_9;
+SELECT '' as separator_2;
 SELECT 'Sample queries to explore your data:' as sample_queries;
 SELECT 'SELECT * FROM S3_GOLD.DIM_CUSTOMERS LIMIT 10;' as customers;
 SELECT 'SELECT * FROM S3_GOLD.FCT_SALES LIMIT 10;' as sales;
 SELECT 'SELECT customer_segment, COUNT(*), AVG(final_total) FROM S3_GOLD.FCT_SALES GROUP BY customer_segment;' as analysis;
+SELECT '' as separator_3;
+SELECT '🔍 CUSTOMER LIFECYCLE ANALYSIS:' as lifecycle_analysis;
+SELECT 'SELECT SUBSTRING(customer_id, 6, 10) as epoch_id, COUNT(*) FROM S3_GOLD.DIM_CUSTOMERS GROUP BY 1 ORDER BY 1;' as epoch_analysis;
+SELECT 'SELECT DATE(TIMESTAMP), COUNT(*) as events FROM S1_RAW_DATA.RAW_RETAIL_EVENTS GROUP BY 1 ORDER BY 1 DESC LIMIT 10;' as daily_events;
 
+CALL GENERATE_HISTORICAL_DATA();
 
 CALL START_PIPELINE();
-CALL GENERATE_RETAIL_DATA(2000, 5000, 150, 100);
-CALL CHECK_PIPELINE_STATUS();
+SHOW TASKS IN DATABASE RETAIL_STREAMING_DEMO;
+
+-- =============================================================================
+-- MANUAL TASK EXECUTION (for testing and immediate data generation)
+-- =============================================================================
+
+-- Execute the root task (data generation)
+EXECUTE TASK DATA_GENERATION_TASK;
+
+-- View the results
 SELECT * FROM TABLE(DATA_SUMMARY());  
-SELECT * FROM TABLE(VIEW_REFERENCE_CONFIG()); 
