@@ -53,6 +53,7 @@ graph TD
 - 🔄 **Consistent customer data** - Same customer always has same attributes
 - 🤖 **ML-ready features** - Built-in churn probability, lifetime value
 - ⚡ **Pure Snowflake** - No external tools, schedulers, or dependencies
+- 🔀 **Unified generator** - Single class for both real-time and historical data generation
 
 ## 📋 What You Need
 
@@ -254,6 +255,55 @@ CALL VIEW_REFERENCE_CONFIG();
 CALL VIEW_GENERATION_AUDIT();
 ```
 
+## 🔀 Unified Data Generator Architecture
+
+The pipeline uses a single `RetailDataGenerator` class that handles both real-time and historical data generation through a `generation_date` parameter.
+
+### Design Principles
+- **Single source of truth**: One class, one set of business logic
+- **Mode switching**: `generation_date=None` → real-time, with date → historical
+- **Zero duplication**: Purchase logic, pricing, discounts identical across modes
+- **Guaranteed consistency**: Historical and real-time data cannot drift apart
+
+### Real-time Mode (Default)
+```python
+# Automatically used by GENERATE_RETAIL_DATA()
+generator = RetailDataGenerator(session)  # No date = real-time
+events = generator.generate_purchase_events(100)
+```
+
+**Features:**
+- Uses current timestamp
+- Manages sliding window of customers (churn + acquisition)
+- Persistent customer pool from database
+- Scales events based on active customer count
+
+### Historical Mode (Backfill)
+```python
+# Automatically used by GENERATE_HISTORICAL_DATA()
+gen_date = datetime(2023, 6, 15)
+generator = RetailDataGenerator(session, generation_date=gen_date)
+events = generator.generate_purchase_events(100)
+```
+
+**Features:**
+- Uses specified date for timestamp
+- Simulates customer evolution (growth + churn)
+- Applies 15% year-over-year growth multiplier
+- Day-of-week and seasonal patterns
+
+### Shared Business Logic
+Both modes use identical:
+- ✅ Seasonal multipliers (category-specific peaks)
+- ✅ Day-of-week patterns (weekends 20% busier)
+- ✅ Pricing logic (segment-based with ±15% variation)
+- ✅ Quantity distributions (Poisson: premium/regular=2, occasional=1)
+- ✅ Discount rates (8-12% when applied)
+
+**Result**: Seamless transition from historical data to real-time generation with no discontinuities.
+
+For more details, see [`REFACTORING_SUMMARY.md`](REFACTORING_SUMMARY.md).
+
 ### Customizing Data Generation
 ```sql
 -- Generate specific event volumes
@@ -441,5 +491,48 @@ This project follows a **radical simplicity** approach:
 ✅ **Bronze → Gold Architecture** - Streamlined 2-layer approach  
 ✅ **One-Click Setup** - Run one SQL script and you're done  
 ✅ **Change Tracking** - MD5 checksums detect configuration changes  
+
+## 🤖 Machine Learning Demo
+
+The repository includes a Jupyter notebook (`snowflake_ml_demo.ipynb`) that demonstrates Snowflake's native ML capabilities:
+
+### Time Series Forecasting with ML.FORECAST
+- Forecast 30 days of revenue with confidence intervals
+- Visualize historical trends vs. predictions
+- Analyze seasonal patterns and growth
+
+### Customer Classification with ML.CLASSIFICATION
+- Train models to predict customer segments
+- Feature engineering directly in Snowflake
+- Real-time predictions on new customers
+
+### Business Insights
+- Identify high-value customers at risk of churning
+- Analyze product preferences by segment
+- Generate actionable recommendations
+
+**To run the notebook:**
+
+**Option 1: Snowflake Notebooks (Recommended) ⭐**
+1. Upload `snowflake_ml_demo.ipynb` to Snowflake Notebooks
+2. Select **Container Runtime** (Python 3.10+)
+3. Set warehouse to `RETAIL_TRANSFORM_WH`
+4. Run all cells - everything is pre-configured!
+
+**Option 2: Local Jupyter**
+```bash
+# Install dependencies
+pip install snowflake-connector-python pandas matplotlib seaborn
+
+# Update connection credentials in the notebook
+jupyter notebook snowflake_ml_demo.ipynb
+```
+
+**Key benefits:**
+- ✅ No data movement - ML runs where your data lives
+- ✅ Native SQL integration - Use ML functions in queries
+- ✅ Automatic feature engineering
+- ✅ Scalable to billions of rows
+- ✅ Runs natively in Snowflake Notebooks (no external setup!)
 
 **📧 Questions?** The 2-minute setup is right at the top of this README - just copy, paste, and run!
